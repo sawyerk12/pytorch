@@ -600,8 +600,10 @@ torch.library.register_autograd(
 
 def all_reduce_backward(ctx, grad_output: torch.Tensor):
     """
-    Backward for all_reduce: all_reduce with same reduce_op.
-    Forward aggregates tensors, backward aggregates gradients.
+    Backward for all_reduce: all_reduce with sum reduce_op.
+
+    For sum, backward aggregates gradients via all_reduce(sum). For avg,
+    backward scales gradients by 1/world_size then aggregates via all_reduce(sum).
 
     Args:
         ctx: Context object
@@ -614,14 +616,23 @@ def all_reduce_backward(ctx, grad_output: torch.Tensor):
     group_name = ctx.group_name
     reduce_op = ctx.reduce_op
 
-    if reduce_op != "sum":
+    if reduce_op not in ("sum", "avg"):
         raise RuntimeError(
-            f"all_reduce backward only supports 'sum' reduction, got '{reduce_op}'"
+            f"all_reduce backward only supports 'sum' and 'avg' reductions, got '{reduce_op}'"
         )
 
-    # Backward does all_reduce with the same reduce_op
+    grad_output = grad_output.contiguous()
+    backward_reduce_op = reduce_op
+    if reduce_op == "avg":
+        if group_name is None or group_name == "":
+            group = c10d._get_default_group()
+        else:
+            group = c10d._resolve_process_group(group_name)
+        grad_output = grad_output / dist.get_world_size(group)
+        backward_reduce_op = "sum"
+
     output = torch.ops._c10d_functional.all_reduce(
-        grad_output.contiguous(), reduce_op, group_name
+        grad_output, backward_reduce_op, group_name
     )
     return wait_tensor(output), None, None
 
